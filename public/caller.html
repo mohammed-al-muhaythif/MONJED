@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="ar">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>واجهة المتصل - مُنجِد</title>
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <div class="brand">مُنجِد</div>
+  
+  <div class="container">
+    <h1>واجهة المتصل</h1>
+
+    <label>
+      معرّف المكالمة
+      <input id="callId" value="call-1" />
+    </label>
+
+    <div class="controls">
+      <button id="connectBtn" class="btn">اتصال</button>
+      <button id="disconnectBtn" class="btn danger" disabled>قطع الاتصال</button>
+    </div>
+
+    <div class="controls">
+      <div id="connIndicator" class="indicator">غير متصل</div>
+      <div style="color: #9ca3af; font-size: 14px;">
+        مدة الاتصال: <span id="timer">00:00</span>
+      </div>
+    </div>
+
+    <h3>الردود الواردة</h3>
+    <pre id="replies">—</pre>
+
+    <audio id="player" hidden></audio>
+  </div>
+
+  <script src="caller.js"></script>
+</body>
+</html>
