@@ -5,89 +5,210 @@ const timerSpan = document.getElementById('timer');
 const repliesPre = document.getElementById('replies');
 const callIdInput = document.getElementById('callId');
 
+const CHUNK_INTERVAL_MS = 3500;
+const MIN_CHUNK_BYTES = 1500;
+const VOICE_THRESHOLD = 15;
+const SILENCE_TIMEOUT_MS = 1500;
+const VOICE_CHECK_INTERVAL_MS = 100;
+
 let ws = null;
 let mediaRecorder = null;
+let mediaStream = null;
+let audioContext = null;
 let timerInterval = null;
 let startTime = null;
 let audioSendInterval = null;
-let audioContext = null;
-let analyser = null;
-let isRecordingActive = false;
+let voiceCheckInterval = null;
 let silenceTimeout = null;
+let isRecordingActive = false;
 let hasVoiceActivity = false;
 
 function formatTime(ms) {
   const s = Math.floor(ms / 1000);
-  const mm = String(Math.floor(s/60)).padStart(2,'0');
-  const ss = String(s%60).padStart(2,'0');
+  const mm = String(Math.floor(s / 60)).padStart(2, '0');
+  const ss = String(s % 60).padStart(2, '0');
   return `${mm}:${ss}`;
 }
 
-// ⭐ كشف النشاط الصوتي
+function wsUrl() {
+  const protocol = location.protocol === 'https:' ? 'wss' : 'ws';
+  return `${protocol}://${location.host}`;
+}
+
 function setupVoiceDetection(stream) {
   audioContext = new (window.AudioContext || window.webkitAudioContext)();
-  analyser = audioContext.createAnalyser();
-  const microphone = audioContext.createMediaStreamSource(stream);
-  
+  const analyser = audioContext.createAnalyser();
   analyser.fftSize = 512;
   analyser.smoothingTimeConstant = 0.8;
-  microphone.connect(analyser);
-  
-  const bufferLength = analyser.frequencyBinCount;
-  const dataArray = new Uint8Array(bufferLength);
-  
-  function checkAudioLevel() {
+  audioContext.createMediaStreamSource(stream).connect(analyser);
+
+  const dataArray = new Uint8Array(analyser.frequencyBinCount);
+
+  voiceCheckInterval = setInterval(() => {
     analyser.getByteFrequencyData(dataArray);
-    
+
     let sum = 0;
-    for (let i = 0; i < bufferLength; i++) {
-      sum += dataArray[i];
-    }
-    const average = sum / bufferLength;
-    
-    // ⭐ LOWERED threshold from 20 to 15 - more sensitive
-    if (average > 15) {
+    for (let i = 0; i < dataArray.length; i++) sum += dataArray[i];
+    const average = sum / dataArray.length;
+
+    if (average > VOICE_THRESHOLD) {
       if (!hasVoiceActivity) {
-        console.log('🎤 Voice detected! Starting recording...');
         hasVoiceActivity = true;
         if (!isRecordingActive && mediaRecorder && mediaRecorder.state === 'inactive') {
           mediaRecorder.start();
           isRecordingActive = true;
         }
       }
-      
       if (silenceTimeout) clearTimeout(silenceTimeout);
       silenceTimeout = setTimeout(() => {
-        console.log('🔇 Silence detected');
         hasVoiceActivity = false;
-      }, 1500);
+      }, SILENCE_TIMEOUT_MS);
     }
-    
-    requestAnimationFrame(checkAudioLevel);
-  }
-  
-  checkAudioLevel();
+  }, VOICE_CHECK_INTERVAL_MS);
 }
 
-async function sendAudioChunk() {
-  if (!mediaRecorder || mediaRecorder.state !== 'recording') {
-    console.log('⚠️ MediaRecorder not recording, skipping send');
+function restartRecordingIfNeeded() {
+  setTimeout(() => {
+    if (mediaRecorder && mediaRecorder.state === 'inactive' && hasVoiceActivity) {
+      mediaRecorder.start();
+      isRecordingActive = true;
+    }
+  }, 100);
+}
+
+function flushCurrentChunk() {
+  if (mediaRecorder && mediaRecorder.state === 'recording') {
+    mediaRecorder.stop();
+    isRecordingActive = false;
+  }
+}
+
+function stopCapture() {
+  if (audioSendInterval) {
+    clearInterval(audioSendInterval);
+    audioSendInterval = null;
+  }
+  if (voiceCheckInterval) {
+    clearInterval(voiceCheckInterval);
+    voiceCheckInterval = null;
+  }
+  if (silenceTimeout) {
+    clearTimeout(silenceTimeout);
+    silenceTimeout = null;
+  }
+  if (mediaRecorder && mediaRecorder.state === 'recording') {
+    try {
+      mediaRecorder.stop();
+    } catch (err) {
+      console.error('MediaRecorder stop error:', err);
+    }
+  }
+  mediaRecorder = null;
+  if (mediaStream) {
+    mediaStream.getTracks().forEach(track => track.stop());
+    mediaStream = null;
+  }
+  if (audioContext) {
+    audioContext.close().catch(() => {});
+    audioContext = null;
+  }
+  if (timerInterval) {
+    clearInterval(timerInterval);
+    timerInterval = null;
+  }
+  isRecordingActive = false;
+  hasVoiceActivity = false;
+}
+
+function sendChunk(base64) {
+  const callId = callIdInput.value.trim();
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({
+      type: 'audio-chunk',
+      callId,
+      file: base64,
+      timestamp: Date.now()
+    }));
+  }
+}
+
+async function startAudioCapture() {
+  mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+
+  setupVoiceDetection(mediaStream);
+
+  let mimeType = 'audio/webm;codecs=opus';
+  if (!MediaRecorder.isTypeSupported(mimeType)) {
+    mimeType = 'audio/webm';
+  }
+
+  mediaRecorder = new MediaRecorder(mediaStream, { mimeType });
+
+  mediaRecorder.ondataavailable = (e) => {
+    if (!e.data || e.data.size === 0) return;
+
+    if (e.data.size < MIN_CHUNK_BYTES) {
+      restartRecordingIfNeeded();
+      return;
+    }
+
+    const reader = new FileReader();
+    reader.onload = () => {
+      const base64 = String(reader.result).split(',')[1];
+      if (base64) sendChunk(base64);
+      restartRecordingIfNeeded();
+    };
+    reader.onerror = () => {
+      console.error('FileReader error');
+      restartRecordingIfNeeded();
+    };
+    reader.readAsDataURL(e.data);
+  };
+
+  mediaRecorder.onerror = (e) => {
+    console.error('MediaRecorder error:', e);
+  };
+
+  audioSendInterval = setInterval(flushCurrentChunk, CHUNK_INTERVAL_MS);
+}
+
+function handleServerMessage(evt) {
+  let d;
+  try {
+    d = JSON.parse(evt.data);
+  } catch {
     return;
   }
 
-  mediaRecorder.stop();
-  isRecordingActive = false;
+  if (d.type === 'operator-reply') {
+    const text = d.text || '';
+    repliesPre.textContent += `[الموظف] ${text}\n`;
+    repliesPre.scrollTop = repliesPre.scrollHeight;
+
+    if (d.audio) {
+      try {
+        const mimeType = d.mime || 'audio/mpeg';
+        const audio = new Audio(`data:${mimeType};base64,${d.audio}`);
+        audio.play().catch(err => console.error('Audio playback failed:', err));
+      } catch (err) {
+        console.error('Audio playback error:', err);
+      }
+    }
+  } else if (d.type === 'transcription') {
+    repliesPre.textContent += `[نسخ] ${d.text || ''}\n`;
+    repliesPre.scrollTop = repliesPre.scrollHeight;
+  } else if (d.type === 'error') {
+    console.error('Server error:', d.message);
+  }
 }
 
-connectBtn.onclick = async () => {
+connectBtn.onclick = () => {
   const callId = callIdInput.value.trim();
   if (!callId) return alert('ادخل Call ID');
 
-  ws = new WebSocket(`ws://${location.host}`);
-  
-  ws.onopen = async () => {
-    console.log('✅ WebSocket connected');
+  ws = new WebSocket(wsUrl());
 
+  ws.onopen = async () => {
     connIndicator.textContent = 'متصل';
     connIndicator.classList.add('connected');
     connectBtn.disabled = true;
@@ -101,193 +222,32 @@ connectBtn.onclick = async () => {
     }, 500);
 
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      console.log('✅ Microphone access granted');
-      
-      setupVoiceDetection(stream);
-      
-      let mimeType = 'audio/webm;codecs=opus';
-      if (!MediaRecorder.isTypeSupported(mimeType)) {
-        mimeType = 'audio/webm';
-      }
-      
-      mediaRecorder = new MediaRecorder(stream, { mimeType });
-      
-      mediaRecorder.ondataavailable = async (e) => {
-        if (e.data && e.data.size > 0) {
-          console.log(`📦 Chunk ready: ${(e.data.size / 1024).toFixed(2)} KB`);
-          
-          // ⭐ LOWERED minimum size for 3.5 second chunks
-          if (e.data.size < 1500) {  // Adjusted for 3.5 seconds
-            console.log('⚠️ Chunk too small, skipping');
-            // ⭐ ALWAYS restart recording after processing
-            if (mediaRecorder.state === 'inactive' && hasVoiceActivity) {
-              setTimeout(() => {
-                if (mediaRecorder.state === 'inactive') {
-                  mediaRecorder.start();
-                  isRecordingActive = true;
-                }
-              }, 100);
-            }
-            return;
-          }
-          
-          const reader = new FileReader();
-          reader.onload = () => {
-            const base64 = reader.result.split(',')[1];
-            const callId = callIdInput.value.trim();
-            
-            if (ws && ws.readyState === WebSocket.OPEN) {
-              ws.send(JSON.stringify({ 
-                type: 'audio-chunk',
-                callId, 
-                file: base64,
-                timestamp: Date.now()
-              }));
-              console.log(`✅ Sent chunk: ${(e.data.size / 1024).toFixed(2)} KB`);
-            }
-            
-            // ⭐ ALWAYS restart recording after sending
-            setTimeout(() => {
-              if (mediaRecorder.state === 'inactive' && hasVoiceActivity) {
-                mediaRecorder.start();
-                isRecordingActive = true;
-              }
-            }, 100);
-          };
-          reader.readAsDataURL(e.data);
-        }
-      };
-      
-      mediaRecorder.onstart = () => {
-        console.log('🎤 Recording chunk started');
-      };
-      
-      mediaRecorder.onstop = () => {
-        console.log('⏸️ Recording chunk stopped');
-      };
-      
-      mediaRecorder.onerror = (e) => {
-        console.error('❌ MediaRecorder error:', e);
-      };
-      
-      // ⭐ Changed to 3.5 seconds
-      audioSendInterval = setInterval(() => {
-        sendAudioChunk();
-      }, 3500); // 3.5 seconds
-      
-      console.log('✅ Voice detection active - sending audio every 3.5 seconds when voice detected');
-      
+      await startAudioCapture();
     } catch (err) {
-      console.error('❌ Microphone error:', err);
+      console.error('Microphone error:', err);
       alert('تعذر الوصول إلى الميكروفون: ' + err.message);
     }
   };
 
-  ws.onmessage = (evt) => {
-    const d = JSON.parse(evt.data);
-
-    if (d.type === 'operator-reply') {
-      const text = d.text || '';
-      repliesPre.textContent += `[الموظف] ${text}\n`;
-      repliesPre.scrollTop = repliesPre.scrollHeight;
-
-      console.log("Received operator-reply, audio length =", d.audio ? d.audio.length : "NO_AUDIO");
-
-      if (d.audio) {
-        try {
-          const mimeType = d.mime || 'audio/mpeg';
-          const audio = new Audio(`data:${mimeType};base64,${d.audio}`);
-          audio.play().catch(err => console.log("audio.play() failed:", err));
-        } catch (err) {
-          console.log("Audio creation/playback error:", err);
-        }
-      }
-    }
-    else if (d.type === 'transcription') {
-      repliesPre.textContent += `[نسخ] ${d.text || ''}\n`;
-      repliesPre.scrollTop = repliesPre.scrollHeight;
-      console.log('📝 Transcription received:', d.text);
-    }
-    else if (d.type === 'error') {
-      console.error('❌ Server error:', d.message);
-    }
-    else if (d.type === 'registered') {
-      console.log('✅ Registered as caller');
-    }
-  };
+  ws.onmessage = handleServerMessage;
 
   ws.onclose = () => {
-    console.log('❌ WebSocket closed');
     connIndicator.textContent = 'مفصول';
     connIndicator.classList.remove('connected');
     connectBtn.disabled = false;
     disconnectBtn.disabled = true;
-    
-    if (audioSendInterval) {
-      clearInterval(audioSendInterval);
-      audioSendInterval = null;
-    }
-    
-    if (silenceTimeout) {
-      clearTimeout(silenceTimeout);
-      silenceTimeout = null;
-    }
-    
-    if (mediaRecorder && mediaRecorder.state === 'recording') {
-      mediaRecorder.stop();
-    }
-    
-    if (audioContext) {
-      audioContext.close();
-      audioContext = null;
-    }
-    
-    if (timerInterval) {
-      clearInterval(timerInterval);
-      timerInterval = null;
-    }
-    
+    stopCapture();
     timerSpan.textContent = '00:00';
-    isRecordingActive = false;
-    hasVoiceActivity = false;
   };
 
   ws.onerror = (e) => {
-    console.error('❌ WebSocket error:', e);
+    console.error('WebSocket error:', e);
   };
 };
 
-disconnectBtn.onclick = async () => {
-  console.log('🛑 Disconnect button clicked');
-  
-  if (audioSendInterval) {
-    clearInterval(audioSendInterval);
-    audioSendInterval = null;
-  }
-
-  if (silenceTimeout) {
-    clearTimeout(silenceTimeout);
-    silenceTimeout = null;
-  }
-
-  if (mediaRecorder && mediaRecorder.state === 'recording') {
-    mediaRecorder.stop();
-    console.log('🎤 Recording stopped');
-  }
-
-  if (audioContext) {
-    audioContext.close();
-    audioContext = null;
-  }
-
+disconnectBtn.onclick = () => {
+  stopCapture();
   if (ws) {
-    setTimeout(() => {
-      ws.close();
-      console.log('🔌 WebSocket closed');
-    }, 200);
+    setTimeout(() => ws.close(), 200);
   }
-  
-  isRecordingActive = false;
-  hasVoiceActivity = false;
 };
